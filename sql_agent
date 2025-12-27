@@ -1,0 +1,357 @@
+from sqlalchemy import create_engine, text
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from pydantic_ai import Agent, RunContext, ModelRetry
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from pydantic_ai.messages import ModelMessage
+from dataclasses import dataclass, field
+from rich import print
+from datetime import datetime
+from opentelemetry import trace
+from typing import List
+from pathlib import Path
+
+
+import base64
+import asyncio
+import os
+import json
+import logging
+import pandas as pd
+import logfire
+import logging
+from rich.logging import RichHandler
+
+load_dotenv('.env')
+
+LANGFUSE_AUTH = base64.b64encode(f"{os.environ['LANGFUSE_PUB_KEY']}:{os.environ['LANGFUSE_SEC_KEY']}".encode()).decode()
+os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Basic {LANGFUSE_AUTH}"
+
+logfire.configure(
+    service_name='logfire_service',
+    send_to_logfire=False,
+    console=False,
+    scrubbing=False
+)
+logfire.instrument_httpx(capture_all=True)
+
+def load_models():
+    with open(r'C:\Users\206854400\Assistant\helper\utils\models.json') as f:
+        return json.load(f)
+    
+models = load_models()
+
+ollama_model = OpenAIChatModel(
+    model_name=models['gpt'], provider=OpenAIProvider(base_url='http://25gpt.com:11434/v1')
+)
+
+def configure_tracer():
+    trace_provider = TracerProvider()
+    trace_provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
+    tracer = trace.get_tracer("my.tracer.name")
+    return tracer
+
+@dataclass
+class SQLDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict)
+    # Default backend: in-memory SQLite
+    engine = create_engine("sqlite:///:memory:")
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store a DataFrame and return a reference like Out[1]."""
+        ref = f"Out[{len(self.output) + 1}]"
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(f"Error: {ref} is not a valid variable reference.")
+        return self.output[ref]
+
+# Define Pydantic Models for outputs
+class LoadCSVResult(BaseModel):
+    message: str
+    reference: str = None
+    shape: tuple = None
+    table_name: str = None
+
+class HeadResult(BaseModel):
+    dataset_reference: str
+    columns_info: dict
+    preview: list
+
+class FilterRowsResult(BaseModel):
+    message: str
+    reference: str
+    shape: tuple = None
+
+class GroupByAggResult(BaseModel):
+    message: str
+    reference: str
+    shape: tuple = None
+
+class DescribeResult(BaseModel):
+    dataset_reference: str
+    stats: dict
+
+class RunSQLResult(BaseModel):
+    message: str
+    reference: str
+    shape: tuple = None
+
+class SaveCSVResult(BaseModel):
+    message: str
+    file_path: str
+
+class Success(BaseModel):
+    """Response when SQL could be successfully generated and the answer to the user's request."""
+
+    sql_query: str = Field(description='The SQL query that was generated')
+    explain: str = Field(description='explain the query')
+    answer: str = Field(description="answer to user's question")
+
+async def summarize_old_messages(messages: list[ModelMessage]) -> list[ModelMessage]:
+    # Summarize the oldest 10 messages
+    if len(messages) <= 10:
+        return messages
+    summary = await summarize_agent.run('give me a summary', message_history=messages)
+    return summary.new_messages() + messages[-1:]
+
+summarize_agent = Agent(
+    model=ollama_model,
+    instructions="""
+        Summarize this conversation, omitting small talk and unrelated topics.
+        Focus on the technical discussion and next steps.
+    """
+)
+
+SQLAgent = Agent(
+    model=ollama_model,
+    model_settings={'temperature':0.0},
+    deps_type=SQLDeps,
+    instrument=True,
+    retries=5,
+    history_processors=[summarize_old_messages],
+    end_strategy="exhaustive",
+    instructions="""
+        You are a Crowdstrike data analyst assistant. You help analyze csv data from the console. 
+        Help build reports about sensors from the csv file like:
+
+        Cloud service accounts
+        Sensor version
+        Reduced FUnctionality Mode
+        Sensor Update Polices
+        Host Groups
+        
+        You have access to a set of tools that allow you to:
+        - Load CSV files into memory and register them as tables.
+        - Manipulate DataFrames using pandas-based tools (safe, structured operations).
+        - Run SQL queries on the registered tables via SQLite.
+        - Save results back to CSV files.
+
+        ### How to behave
+        - Prefer pandas tools (head, filter_rows, groupby_agg, describe) for simple operations.
+        - Use SQL (run_sql) only when the operation is complex or not easily expressed with the pandas tools.
+        - Always refer to datasets using their reference names (e.g., Out[1], Out[2]) when calling tools.
+        - Never assume columns exist. First inspect the dataset using `head` or `describe` before filtering or aggregating.
+        - When filtering, grouping, or aggregating, confirm column names exactly as they appear in the dataset.
+        - If an error occurs (invalid column, invalid SQL), retry with a corrected query.
+        - If you generate new DataFrames, store them using the tools so they can be referenced later.
+
+        ### Examples
+        - To preview a dataset after loading: call `head(dataset="Out[1]")`.
+        - To filter rows where sentiment == "negative": `filter_rows(dataset="Out[1]", column="sentiment", value="negative")`.
+        - To group by a column and count: `groupby_agg(dataset="Out[1]", by="label", column="id", agg="count")`.
+        - To run a complex join or multi-condition query: use `run_sql("SELECT ... FROM dataset ...")`.
+        - To save results: `save_csv(dataset="Out[2]", path="results.csv")`.
+
+        Your goal is to help the user analyze their data efficiently and correctly.
+        Always provide clear and concise reasoning in natural language, but rely on the tools for execution.
+    """
+)
+
+@SQLAgent.tool()
+async def load_csv(ctx: RunContext[SQLDeps], file: str, table_name: str = "default") -> LoadCSVResult:
+    """Load a CSV file into both pandas df and SQLite databse."""
+    
+    file_path = Path(f"CrowdStrike/Input/{file}")
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        return LoadCSVResult(message=f"File `{file}` not found in ./Input.")
+    except Exception as e:
+        return LoadCSVResult(message=f"Error reading `{file}`: {e}")
+
+    try:
+        df.to_sql(table_name, ctx.deps.engine, if_exists="replace", index=False)
+    except Exception as e:
+        return LoadCSVResult(message=f"Failed to write to SQL table `{table_name}`: {e}")
+
+    try:
+        ref = ctx.deps.store(df)
+    except Exception as e:
+        return LoadCSVResult(message=f"Failed to store dataframe: {e}")
+    
+    result_message = f"Loaded `{file}` as `{ref}`, loaded to SQLite table: `{table_name}`."
+    return LoadCSVResult(
+        message=result_message,
+        reference=ref,
+        shape=df.shape,
+        table_name=table_name
+    )
+
+@SQLAgent.tool
+def head(ctx: RunContext[SQLDeps], reference: str) -> HeadResult:
+    """Show the first 2 rows of a DataFrame."""
+    
+    df = ctx.deps.get(reference)
+    col_info = df.dtypes.astype(str).to_dict()
+    preview = df.head(10).to_dict(orient="records")
+    
+    return HeadResult(
+        dataset_reference=reference,
+        columns_info=col_info,
+        preview=preview
+    )
+
+@SQLAgent.tool
+def filter_rows(ctx: RunContext[SQLDeps], reference: str, column: str, value: str) -> FilterRowsResult:
+    """Filter rows where column == value."""
+    
+    df = ctx.deps.get(reference)
+    dtype = df[column].dtype
+
+    try:
+        if dtype == "bool" or str(dtype).lower() in ("bool", "boolean"):
+            typed_value = value.lower() in ("true", "1", "yes")
+        elif "int" in str(dtype):
+            typed_value = int(value)
+        elif "float" in str(dtype):
+            typed_value = float(value)
+        else:
+            typed_value = value
+    except Exception as e:
+        raise ModelRetry(f"Could not convert value '{value}' to dtype {dtype}: {e}")
+
+    result = df[df[column] == typed_value]
+    
+    try:
+        ref = ctx.deps.store(result)
+    except Exception as e:
+        raise ModelRetry(f"Failed to store dataframe: {e}")
+    
+    return FilterRowsResult(
+        message=f"Filtered {reference} where {column} == {value}",
+        reference=ref,
+        shape=result.shape
+    )
+
+@SQLAgent.tool
+def groupby_agg(ctx: RunContext[SQLDeps], reference: str, by: str, column: str, agg: str) -> GroupByAggResult:
+    """Group by one column and aggregate another with pandas agg."""
+    
+    df = ctx.deps.get(reference)
+    try:
+        result = df.groupby(by)[column].agg(agg).reset_index()
+    except Exception as e:
+        raise ModelRetry(f"Error in groupby/agg: {e}")
+
+    ref = ctx.deps.store(result)
+    
+    return GroupByAggResult(
+        message=f"Grouped {reference} by {by}, aggregated {column} with {agg}",
+        reference=ref,
+        shape=result.shape
+    )
+
+@SQLAgent.tool
+def describe(ctx: RunContext[SQLDeps], reference: str) -> DescribeResult:
+    """Get summary statistics of a DataFrame."""
+    
+    df = ctx.deps.get(reference)
+    desc = df.describe().T
+    desc_dict = desc.to_dict()
+
+    return DescribeResult(
+        dataset_reference=reference,
+        stats=desc_dict
+    )
+
+@SQLAgent.tool
+def run_sql(ctx: RunContext[SQLDeps], sql: str) -> RunSQLResult:
+    """Run an arbitrary SQL query using the backend SQLite Database."""
+    
+    try:
+        with ctx.deps.engine.connect() as conn:
+            result = pd.read_sql(text(sql), conn)
+    except Exception as e:
+        raise ModelRetry(f"SQL error: {e} try DEFAULT table name")
+
+    ref = ctx.deps.store(result)
+
+    return RunSQLResult(
+        message=f"Executed SQL query",
+        reference=ref,
+        shape=result.shape
+    )
+
+@SQLAgent.tool()
+def save_csv(ctx: RunContext[SQLDeps], reference: str, file: str, index: bool = False) -> SaveCSVResult:
+    """
+    Save a stored DataFrame to a CSV file.
+    
+    Args:
+        reference: Reference name of the DataFrame (e.g., Out[1])
+        path: File path to save the CSV to
+        index: Whether to include the DataFrame index in the CSV (default False)
+    """
+    df = ctx.deps.get(reference)
+    try:
+        file_path = Path(f"CrowdStrike/Output/{file}")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(file_path, index=index)
+    except Exception as e:
+        raise ModelRetry(f"Error saving DataFrame `{reference}` to CSV `{file}`: {e}")
+
+    return SaveCSVResult(
+        message=f"Saved DataFrame `{reference}` to `{file}` successfully.",
+        file_path=str(file_path)
+    )
+
+
+HISTORY: List[ModelMessage] = []
+
+async def basic_query(prompt: str, deps: SQLDeps):
+    if prompt:
+        tracer = configure_tracer()
+        with tracer.start_as_current_span("Pydantic-Ai-Trace") as span:
+            async with SQLAgent:
+                result = await SQLAgent.run(prompt, deps=deps, message_history=HISTORY)
+            print(result.output)
+            span.set_attribute("input.value", prompt)
+            span.set_attribute("output.value", result.output)
+            HISTORY.extend(result.all_messages())
+            
+
+async def chat_loop():
+    bot_deps = SQLDeps()
+    print("Ask me anything. Type 'exit' to quit.")
+    while True:
+        user_input = input("\nYou: ")
+        if user_input.strip().lower() in {"exit", "quit"}:
+            print("Goodbye!")
+            break
+        await basic_query(user_input, bot_deps)
+
+
+if __name__ == "__main__":
+    asyncio.run(chat_loop())
+
+
+
+
+
